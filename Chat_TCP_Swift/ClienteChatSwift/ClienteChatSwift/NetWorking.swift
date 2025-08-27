@@ -97,6 +97,7 @@ final class PrivateListener {
     private let queue = DispatchQueue(label: "private.listener.queue")
     var localPort: UInt16 = 0
     var onIncoming: ((PrivateChatSession) -> Void)?
+    var onReady: ((UInt16) -> Void)?          // <-- NOVO
 
     func start() throws {
         let params = NWParameters.tcp
@@ -105,55 +106,86 @@ final class PrivateListener {
 
         l.newConnectionHandler = { [weak self] conn in
             guard let self else { return }
-            let session = PrivateChatSession(existing: conn)
+            let session = PrivateChatSession(existing: conn)   // <- só isso
             self.onIncoming?(session)
             session.start()
         }
 
+
         l.stateUpdateHandler = { [weak self] state in
+            guard let self else { return }
             if case .ready = state, let port = l.port {
-                self?.localPort = port.rawValue
+                self.localPort = port.rawValue
+                self.onReady?(self.localPort)      // <-- NOVO
             }
         }
 
         l.start(queue: queue)
     }
-
-    func stop() {
-        listener?.cancel()
-        listener = nil
-    }
+    func stop() { listener?.cancel(); listener = nil }
 }
+
 
 // MARK: - Sessão P2P
 final class PrivateChatSession: ObservableObject, Identifiable {
     let id = UUID()
     @Published var messages: [String] = []
+
+    // Metadados (var para permitir hidratação posterior)
+    @Published var localNickname: String?
+    @Published var localIP: String?
+    @Published var localPort: UInt16?
+    @Published var remoteNick: String?
+    let remoteHost: String?
+    let remotePort: UInt16?
+
     private var connection: NWConnection?
     private let queue = DispatchQueue(label: "private.chat.session")
-    private let localNickname: String?
 
-    // Conectar ativo
-    init(host: String, port: UInt16, localNickname: String? = nil) {
+    // Ativo
+    init(host: String, port: UInt16, localNickname: String, localIP: String, localPort: UInt16, remoteNick: String?) {
         self.localNickname = localNickname
+        self.localIP = localIP
+        self.localPort = localPort
+        self.remoteNick = remoteNick
+        self.remoteHost = host
+        self.remotePort = port
         let endpoint = NWEndpoint.Host(host)
         let nwPort = NWEndpoint.Port(rawValue: port)!
-        connection = NWConnection(host: endpoint, port: nwPort, using: .tcp)
+        self.connection = NWConnection(host: endpoint, port: nwPort, using: .tcp)
     }
-    // Conexão recebida
+
+    // Entrante
     init(existing: NWConnection) {
-        connection = existing
-        self.localNickname = nil
+        self.connection = existing
+        self.remoteNick = nil
+        if case let .hostPort(host, port) = existing.endpoint {
+            self.remoteHost = host.debugDescription
+            self.remotePort = port.rawValue
+        } else {
+            self.remoteHost = nil
+            self.remotePort = nil
+        }
+    }
+
+    // >>> NOVO: hidrata dados locais depois de aceitar a conexão
+    func hydrateLocal(nick: String, ip: String, port: UInt16) {
+        self.localNickname = nick
+        self.localIP = ip
+        self.localPort = port
     }
 
     func start() {
         connection?.stateUpdateHandler = { [weak self] state in
+            guard let self else { return }
             switch state {
             case .ready:
-                if let name = self?.localNickname {
-                    self?.connection?.send(content: Data(name.utf8), completion: .contentProcessed({ _ in }))
+                if let name = self.localNickname {
+                    self.connection?.send(content: Data(name.utf8), completion: .contentProcessed({ _ in }))
                 }
-                self?.receiveLoop()
+                self.receiveLoop()
+            case .failed(let err):
+                self.append("[erro] \(err.localizedDescription)")
             default: break
             }
         }
@@ -162,28 +194,39 @@ final class PrivateChatSession: ObservableObject, Identifiable {
 
     func send(_ text: String) {
         guard let conn = connection else { return }
-        let data = Data(text.utf8)
-        conn.send(content: data, completion: .contentProcessed({ _ in }))
+        let prefix = localNickname ?? "eu"
+        let wire = "[\(prefix)] \(text)"
+        conn.send(content: Data(wire.utf8), completion: .contentProcessed({ _ in }))
         append("Você: \(text)")
     }
 
     private func receiveLoop() {
         connection?.receive(minimumIncompleteLength: 1, maximumLength: 4096) { [weak self] data, _, isComplete, error in
+            guard let self else { return }
             if let d = data, !d.isEmpty, let s = String(data: d, encoding: .utf8) {
-                self?.append(s)
+                if self.remoteNick == nil, s.count <= 64, !s.contains(" "), !s.contains(":"), !s.contains("[") {
+                    DispatchQueue.main.async { self.remoteNick = s }
+                } else {
+                    self.append(s)
+                }
             }
-            if error == nil && !isComplete {
-                self?.receiveLoop()
-            }
+            if error == nil && !isComplete { self.receiveLoop() }
         }
     }
 
-    private func append(_ s: String) {
-        DispatchQueue.main.async { self.messages.append(s) }
+    private func append(_ s: String) { DispatchQueue.main.async { self.messages.append(s) } }
+
+    var windowTitle: String {
+        let me = "\(localNickname ?? "eu") @ \(localIP ?? "?"):\(localPort ?? 0)"
+        let dstNick = remoteNick ?? "destino"
+        let dst = "\(dstNick) @ \(remoteHost ?? "?"):\(remotePort ?? 0)"
+        return "Privado • \(me) ⇄ \(dst)"
     }
 
     func close() { connection?.cancel() }
 }
+
+
 
 // MARK: - Chat Client (TCP 1998)
 final class ChatClient {

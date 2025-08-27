@@ -31,6 +31,10 @@ func firstNonLoopbackIPv4() -> String {
     return address
 }
 
+func ts() -> String {
+    let f = DateFormatter(); f.dateFormat = "HH:mm:ss"; return f.string(from: Date())
+}
+
 // --------- Modelo/Estado ----------
 struct ClientInfo {
     let channel: Channel
@@ -51,12 +55,14 @@ final class ServerState {
             byNick[info.apelido.lowercased()] = id
         }
     }
-    func remove(channel: Channel) {
+    func remove(channel: Channel) -> ClientInfo? {
         lock.withLock {
             let id = ObjectIdentifier(channel)
             if let info = byChannel.removeValue(forKey: id) {
                 byNick.removeValue(forKey: info.apelido.lowercased())
+                return info
             }
+            return nil
         }
     }
     func count() -> Int { lock.withLock { byChannel.count } }
@@ -64,6 +70,7 @@ final class ServerState {
         lock.withLock {
             byChannel.values
                 .map { "\($0.apelido);\($0.ip);\($0.portaPrivada)" }
+                .sorted() // ordena para estabilidade visual
                 .joined(separator: "\n") + "\n"
         }
     }
@@ -74,12 +81,15 @@ final class ServerState {
         }
     }
     func all() -> [ClientInfo] { lock.withLock { Array(byChannel.values) } }
+    func nicknames() -> [String] {
+        lock.withLock { byChannel.values.map(\.apelido).sorted() }
+    }
 }
 
 // -------- Handlers ----------
 final class ChatHandler: ChannelInboundHandler {
-    typealias InboundIn  = ByteBuffer
-    typealias OutboundOut = ByteBuffer   // <= Corrige erro 'Never'
+    typealias InboundIn   = ByteBuffer
+    typealias OutboundOut = ByteBuffer
 
     private let state: ServerState
     private let startTime: Date
@@ -99,8 +109,14 @@ final class ChatHandler: ChannelInboundHandler {
     }
 
     func channelInactive(context: ChannelHandlerContext) {
-        state.remove(channel: context.channel)
-        print("Cliente desconectado. Total: \(state.count())")
+        let removed = state.remove(channel: context.channel)
+        if let info = removed {
+            let msg = "[\(ts())] [server] \(info.apelido) saiu. Online: \(state.count())"
+            print("LEAVE  -> \(msg)")
+            broadcast(msg, excluding: nil)
+        } else {
+            print("DESC   -> canal removido, apelido desconhecido. Online: \(state.count())")
+        }
     }
 
     func channelRead(context: ChannelHandlerContext, data: NIOAny) {
@@ -118,42 +134,71 @@ final class ChatHandler: ChannelInboundHandler {
                     portaPrivada = porta
                     state.add(.init(channel: context.channel, apelido: apelido, ip: ipRemoto, portaPrivada: portaPrivada))
                     handshaked = true
-                    print("[\(ts())] Novo usuário: \(apelido) (\(ipRemoto):\(portaPrivada))")
+
+                    // Boas-vindas ao novo cliente
+                    write(context, "[\(ts())] [server] Bem-vindo, \(apelido)! Usuários online: \(state.count())")
+
+                    // Aviso a todos
+                    let joinMsg = "[\(ts())] [server] \(apelido) entrou (\(ipRemoto):\(portaPrivada)). Online: \(state.count())"
+                    print("JOIN   -> \(joinMsg)")
+                    broadcast(joinMsg, excluding: nil)
                 }
             }
             return
         }
 
-        handleMessage(context: context, msg: chunk)
+        handleMessage(context: context, raw: chunk)
     }
 
-    private func handleMessage(context: ChannelHandlerContext, msg: String) {
-        let mensagem = msg.trimmingCharacters(in: .whitespacesAndNewlines)
+    private func handleMessage(context: ChannelHandlerContext, raw: String) {
+        let mensagem = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         switch true {
         case mensagem == "/count":
-            write(context, "Usuarios Conectados: \(state.count())")
+            let resp = "Usuarios Conectados: \(state.count())"
+            print("CMD    -> /count => \(resp)")
+            write(context, resp)
+
         case mensagem == "/lista":
+            print("CMD    -> /lista")
             write(context, state.listCSV())
+
         case mensagem.hasPrefix("/desconectar "):
             let nick = String(mensagem.dropFirst("/desconectar".count)).trimmingCharacters(in: .whitespaces)
+            print("CMD    -> /desconectar \(nick)")
             if let ch = state.findChannel(nick: nick) {
                 ch.close(promise: nil)
                 write(context, "Usuário \(nick) desconectado com sucesso.")
-                print("Usuário \(nick) desconectado via comando.")
+                let msg = "[\(ts())] [server] \(nick) foi desconectado via comando."
+                broadcast(msg, excluding: nil)
             } else {
                 write(context, "Usuário \(nick) não encontrado.")
             }
+
         case mensagem == "/status":
             let up = Int(Date().timeIntervalSince(startTime))
-            write(context, "Servidor online - Usuários conectados: \(state.count()) - Uptime: \(up)s")
+            let resp = "Servidor online - Usuários conectados: \(state.count()) - Uptime: \(up)s"
+            print("CMD    -> /status => \(resp)")
+            write(context, resp)
+
+        case mensagem == "/help":
+            let resp = """
+            Comandos: /count, /lista, /status, /desconectar <apelido>
+            """
+            print("CMD    -> /help")
+            write(context, resp)
+
         default:
-            print("Mensagem: \(mensagem)")
-            broadcast(mensagem)
+            // Broadcast de chat SEMPRE com apelido + timestamp
+            let final = "[\(ts())] \(apelido): \(mensagem)"
+            print("BCAST  -> \(final)")
+            broadcast(final, excluding: nil)
         }
     }
 
-    private func broadcast(_ text: String) {
+    // Broadcast helper (opção de excluir quem enviou, se necessário)
+    private func broadcast(_ text: String, excluding excluded: Channel?) {
         for c in state.all() {
+            if let ex = excluded, ex === c.channel { continue }
             var out = c.channel.allocator.buffer(capacity: text.utf8.count)
             out.writeString(text)
             _ = c.channel.writeAndFlush(out)
@@ -164,17 +209,12 @@ final class ChatHandler: ChannelInboundHandler {
         var out = ctx.channel.allocator.buffer(capacity: text.utf8.count)
         out.writeString(text)
         ctx.writeAndFlush(wrapOutboundOut(out), promise: nil)
-        // Alternativa sem typealias: ctx.channel.writeAndFlush(out, promise: nil)
-    }
-
-    private func ts() -> String {
-        let f = DateFormatter(); f.dateFormat = "HH:mm:ss"; return f.string(from: Date())
     }
 }
 
 final class DiscoveryResponder: ChannelInboundHandler {
-    typealias InboundIn  = AddressedEnvelope<ByteBuffer>
-    typealias OutboundOut = AddressedEnvelope<ByteBuffer>  // <= Corrige erro 'Never'
+    typealias InboundIn   = AddressedEnvelope<ByteBuffer>
+    typealias OutboundOut = AddressedEnvelope<ByteBuffer>
 
     private let serverIP: String
     init(serverIP: String) { self.serverIP = serverIP }
@@ -184,22 +224,26 @@ final class DiscoveryResponder: ChannelInboundHandler {
         var buf = env.data
         guard let msg = buf.readString(length: buf.readableBytes) else { return }
         if msg == "DISCOVER_SERVER" {
-            print("[\(Date())] Discovery de \(env.remoteAddress) → \(serverIP)")
+            // Mantém resposta apenas com IP (compatibilidade legado)
             var out = context.channel.allocator.buffer(capacity: serverIP.utf8.count)
             out.writeString(serverIP)
             let reply = AddressedEnvelope(remoteAddress: env.remoteAddress, data: out)
+            print("UDP-RX -> \(Date()) from \(env.remoteAddress) payload: \(msg) | reply: \(serverIP)")
             context.writeAndFlush(wrapOutboundOut(reply), promise: nil)
-            // Alternativa: context.writeAndFlush(NIOAny(reply), promise: nil)
+        } else {
+            print("UDP-RX -> ignorado payload: \(msg)")
         }
     }
 }
 
 // -------- Bootstrap --------
 func runServer() throws {
-    let CHAT_PORT  = 1998
-    let ADMIN_PORT = 2998
-    let UDP_BCAST  = 30000
-    let UDP_DISC   = 30001
+    // Config “via env” (fallback para defaults)
+    let CHAT_PORT  = Int(ProcessInfo.processInfo.environment["CHAT_PORT"]  ?? "1998") ?? 1998
+    let ADMIN_PORT = Int(ProcessInfo.processInfo.environment["ADMIN_PORT"] ?? "2998") ?? 2998
+    let UDP_BCAST  = Int(ProcessInfo.processInfo.environment["UDP_BCAST"]  ?? "30000") ?? 30000
+    let UDP_DISC   = Int(ProcessInfo.processInfo.environment["UDP_DISC"]   ?? "30001") ?? 30001
+    let BCAST_EVERY_SECONDS: Int64 = Int64(ProcessInfo.processInfo.environment["BCAST_EVERY"] ?? "10") ?? 10
 
     let start = Date()
     let group = MultiThreadedEventLoopGroup(numberOfThreads: System.coreCount)
@@ -207,13 +251,13 @@ func runServer() throws {
     let ip = firstNonLoopbackIPv4()
 
     print("""
-    Servidor Online
-    Ouvindo Chat: \(CHAT_PORT)
-    Ouvindo API/Admin: \(ADMIN_PORT)
+    ====== Servidor Online (\(ts())) ======
+    Ouvindo Chat (TCP): \(CHAT_PORT)
+    Ouvindo Admin (TCP): \(ADMIN_PORT)
     IP do Servidor: \(ip)
-    Listener UDP (discovery): \(UDP_DISC)
-    Broadcast UDP: \(UDP_BCAST)
-    Aguardando conexões...
+    UDP Discovery (RX): \(UDP_DISC)
+    UDP Broadcast (TX): \(UDP_BCAST) a cada \(BCAST_EVERY_SECONDS)s
+    =======================================
     """)
 
     func makeServer(port: Int) throws -> Channel {
@@ -239,17 +283,21 @@ func runServer() throws {
         .channelInitializer { ch in ch.pipeline.addHandler(DiscoveryResponder(serverIP: ip)) }
         .bind(host: "0.0.0.0", port: UDP_DISC).wait()
 
-    // UDP broadcast periódico do IP na 30000
+    // UDP broadcast periódico do IP na 30000 (payload = IP puro)
     let udpBroadcaster = try DatagramBootstrap(group: group)
         .channelOption(ChannelOptions.socketOption(.so_broadcast), value: 1)
         .bind(host: "0.0.0.0", port: 0).wait()
     let bcastAddr = try SocketAddress(ipAddress: "255.255.255.255", port: UDP_BCAST)
-    _ = udpBroadcaster.eventLoop.scheduleRepeatedTask(initialDelay: .seconds(0), delay: .seconds(10)) { _ in
+
+    _ = udpBroadcaster.eventLoop.scheduleRepeatedTask(initialDelay: .seconds(0), delay: .seconds(BCAST_EVERY_SECONDS)) { _ in
         var buf = udpBroadcaster.allocator.buffer(capacity: ip.utf8.count)
         buf.writeString(ip)
         let env = AddressedEnvelope(remoteAddress: bcastAddr, data: buf)
         udpBroadcaster.writeAndFlush(env, promise: nil)
-        print("[\(DateFormatter.localizedString(from: Date(), dateStyle: .none, timeStyle: .medium))] Broadcast UDP enviado: \(ip)")
+
+        // Log do broadcast + visão de conectados (com apelidos)
+        let nicks = state.nicknames().joined(separator: ", ")
+        print("UDP-TX -> \(ts()) broadcast: \(ip) | online=\(state.count()) | nicks=[\(nicks)]")
     }
 
     try chat.closeFuture

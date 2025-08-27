@@ -157,6 +157,53 @@ struct PrivateChatView: View {
     }
 }
 
+// --- IP local (IPv4 não-loopback) ---
+func firstNonLoopbackIPv4() -> String {
+    var address = "127.0.0.1"
+    var ifaddrPtr: UnsafeMutablePointer<ifaddrs>?
+    guard getifaddrs(&ifaddrPtr) == 0, let first = ifaddrPtr else { return address }
+    defer { freeifaddrs(ifaddrPtr) }
+    for ptr in sequence(first: first, next: { $0.pointee.ifa_next }) {
+        let ifa = ptr.pointee
+        if ifa.ifa_addr.pointee.sa_family == UInt8(AF_INET) {
+            var addr = sockaddr_in()
+            memcpy(&addr, ifa.ifa_addr, MemoryLayout<sockaddr_in>.size)
+            let ip = withUnsafePointer(to: &addr.sin_addr) {
+                $0.withMemoryRebound(to: UInt8.self, capacity: 4) { p in
+                    "\(p[0]).\(p[1]).\(p[2]).\(p[3])"
+                }
+            }
+            if ip != "127.0.0.1" { address = ip; break }
+        }
+    }
+    return address
+}
+
+// --- Modifier para setar o título da janela (macOS) ---
+import AppKit
+
+struct WindowTitleModifier: ViewModifier {
+    let title: String
+    func body(content: Content) -> some View {
+        content.background(WindowTitleSetter(title: title))
+    }
+    private struct WindowTitleSetter: NSViewRepresentable {
+        let title: String
+        func makeNSView(context: Context) -> NSView {
+            let v = NSView()
+            DispatchQueue.main.async { v.window?.title = title }
+            return v
+        }
+        func updateNSView(_ nsView: NSView, context: Context) {
+            DispatchQueue.main.async { nsView.window?.title = title }
+        }
+    }
+}
+extension View {
+    func windowTitle(_ title: String) -> some View { modifier(WindowTitleModifier(title: title)) }
+}
+
+
 
 //#Preview {
 //    ContentView()

@@ -9,17 +9,21 @@ import Foundation
 import Combine
 
 final class ChatViewModel: ObservableObject {
+    
     // Inputs
     @Published var nickname: String = ""
     @Published var serverIp: String = ""
     @Published var serverPort: Int = 1998
     @Published var outbound: String = ""
 
+    // Identidade local
+    @Published var myLocalIP: String = firstNonLoopbackIPv4()   // <-- NOVO
+    @Published var myPrivatePort: UInt16 = 0                    // <-- NOVO
+
     // State
     @Published var connected: Bool = false
     @Published var messages: [String] = []
     @Published var users: [UserEntry] = []
-
     @Published var lastOpenedSessionID: UUID?
 
     // Infra
@@ -27,29 +31,29 @@ final class ChatViewModel: ObservableObject {
     private let client = ChatClient()
     private let listener = PrivateListener()
 
-    // Private chat sessions gerenciadas em memória
+    // P2P
     @Published var privateSessions: [UUID: PrivateChatSession] = [:]
-    
     init() {
-        // Listener de broadcast (30000)
+        // Broadcast discovery -> autopreenche IP
         udp.startListening { [weak self] ip in
             guard let self, !self.connected else { return }
             self.serverIp = ip
         }
 
-        client.onMessage = { [weak self] s in
-            self?.append(s)
-        }
-        client.onUserList = { [weak self] list in
-            self?.users = list
-        }
+        client.onMessage = { [weak self] s in self?.append(s) }
+        client.onUserList = { [weak self] list in self?.users = list }
 
-        // Aceitar conexões P2P
         try? listener.start()
+        // Atualiza porta privada local publicada
+        listener.onReady = { [weak self] port in self?.myPrivatePort = port }    // <-- NOVO
+
+        // Conexões entrantes -> abrir janela com metadados locais
         listener.onIncoming = { [weak self] session in
             guard let self else { return }
+            session.hydrateLocal(nick: self.nickname, ip: self.myLocalIP, port: self.myPrivatePort)
             self.registerPrivate(session: session, title: "Privado (entrada)")
         }
+
     }
     
     init(preview: Bool = false) {
@@ -105,12 +109,30 @@ final class ChatViewModel: ObservableObject {
         client.connect(ip: ip,
                        port: port,
                        nickname: nickname,
-                       privatePort: listener.localPort) { [weak self] in
+                       privatePort: myPrivatePort) { [weak self] in
             DispatchQueue.main.async { self?.connected = true }
         } onError: { [weak self] err in
             self?.append("[erro] \(err)")
         }
     }
+
+    func openPrivateChat(to user: UserEntry) {
+        // Sessão ativa com todos os metadados
+        let session = PrivateChatSession(host: user.ip,
+                                         port: UInt16(user.port),
+                                         localNickname: nickname,
+                                         localIP: myLocalIP,
+                                         localPort: myPrivatePort,
+                                         remoteNick: user.nick)
+        session.start()
+        registerPrivate(session: session)
+    }
+
+    func registerPrivate(session: PrivateChatSession) {
+        privateSessions[session.id] = session
+        DispatchQueue.main.async { self.lastOpenedSessionID = session.id }
+    }
+
 
     func disconnect() {
         client.disconnect()
@@ -129,14 +151,6 @@ final class ChatViewModel: ObservableObject {
         client.send(outbound)
         append("Você: \(outbound)")
         outbound = ""
-    }
-
-    func openPrivateChat(to user: UserEntry) {
-        let session = PrivateChatSession(host: user.ip,
-                                         port: UInt16(user.port),
-                                         localNickname: nickname) // opcional: envia apelido no ready
-        session.start()
-        registerPrivate(session: session, title: "Privado com \(user.nick)")
     }
 
     // registerPrivate(...): atualize para guardar a última sessão
